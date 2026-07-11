@@ -1,7 +1,6 @@
 const express = require('express');
 const app = express();
 
-// Ye line PDF ke bade text ko server par aane ki permission degi (50MB tak)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -10,10 +9,10 @@ app.post('/summarize', async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
 
     try {
-        // AI ko command dena ki kis type ki summary chahiye
         const prompt = `Please provide a ${summaryType} for the following text:\n\n${text}`;
 
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        // Yahan maine model ka naam badal kar 'gemini-1.5-flash-latest' kar diya hai
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -23,7 +22,6 @@ app.post('/summarize', async (req, res) => {
 
         const data = await response.json();
         
-        // Agar Gemini API se koi error aaya toh server terminal me dikhayega
         if (!response.ok) {
             console.error("Gemini API Error:", data);
             return res.status(500).json({ error: "Gemini API limit ya key issue" });
