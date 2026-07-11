@@ -11,8 +11,8 @@ app.post('/summarize', async (req, res) => {
     try {
         const prompt = `Please provide a ${summaryType} for the following text:\n\n${text}`;
 
-        // Yahan maine model ka naam badal kar 'gemini-1.5-flash-latest' kar diya hai
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`, {
+        // YAHAN BADLAV KIYA GAYA HAI: Naya Gemini 2.5 Flash model use kiya hai
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
