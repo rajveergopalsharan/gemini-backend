@@ -258,7 +258,6 @@ function calculateFreshSummaryCredits(config, pageCount) {
 // ======================================================
 // PREMIUM ENTITLEMENT
 // ======================================================
-
 async function loadServerVerifiedSubscription(uid) {
   const snapshot = await db
     .collection('users')
@@ -276,15 +275,9 @@ async function loadServerVerifiedSubscription(uid) {
 
   const data = snapshot.data() || {};
 
-  // IMPORTANT:
   // Client-created subscription documents are NOT trusted.
-  //
   // Later Google Play backend verification will set:
-  //
   // verifiedByServer: true
-  //
-  // Current old/client premium docs therefore cannot create
-  // server-authoritative premium entitlement.
   if (data.verifiedByServer !== true) {
     return {
       active: false,
@@ -637,6 +630,7 @@ async function saveAiUsage({
   pageCount,
   creditsCharged,
   summaryType,
+  fromCache = false,
 }) {
   const safeName =
     typeof pdfName === 'string'
@@ -657,7 +651,7 @@ async function saveAiUsage({
       pdfHash: safeHash,
       pageCount,
       creditsCharged,
-      fromCache: false,
+      fromCache: fromCache === true,
       summaryType,
       createdAt:
         admin.firestore.FieldValue.serverTimestamp(),
@@ -667,7 +661,6 @@ async function saveAiUsage({
 // ======================================================
 // CREDIT INFO ENDPOINT
 // ======================================================
-
 app.get('/credits', async (req, res) => {
   try {
     const decodedToken =
@@ -697,6 +690,203 @@ app.get('/credits', async (req, res) => {
       });
   }
 });
+
+// ======================================================
+// SECURE CACHED-SUMMARY CREDIT ENDPOINT
+//
+// Cached summary text device par hi rehta hai.
+// Server sirf configured cached-summary credit cost
+// securely charge karta hai.
+// Client kabhi credit amount decide nahi karega.
+// ======================================================
+
+app.post(
+  '/consume-cached-summary',
+  summarizeLimiter,
+  async (req, res) => {
+    let uid = null;
+    let reservedCredits = 0;
+
+    try {
+      const decodedToken =
+        await authenticateRequest(req);
+
+      uid = decodedToken.uid;
+
+      const {
+        summaryType,
+        pageCount,
+        pdfName,
+        pdfHash,
+      } = req.body || {};
+
+      // -------------------------------
+      // INPUT VALIDATION
+      // -------------------------------
+
+      if (
+        typeof summaryType !== 'string' ||
+        !ALLOWED_SUMMARY_TYPES.has(summaryType)
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_SUMMARY_TYPE',
+          error: 'Invalid summary type.',
+        });
+      }
+
+      const parsedPageCount =
+        Number(pageCount);
+
+      if (
+        !Number.isInteger(parsedPageCount) ||
+        parsedPageCount <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PAGE_COUNT',
+          error: 'Invalid PDF page count.',
+        });
+      }
+
+      // -------------------------------
+      // CONFIG
+      // -------------------------------
+
+      const config =
+        await loadRevenueConfig();
+
+      if (config.maintenanceMode) {
+        return res.status(503).json({
+          success: false,
+          code: 'MAINTENANCE',
+          error:
+            'AI service is temporarily unavailable.',
+        });
+      }
+
+      if (
+        parsedPageCount >
+        config.maxPdfPagesV1
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'PDF_TOO_LARGE',
+          error:
+            'This PDF is too large for AI Summary in V1.',
+        });
+      }
+
+      // Server trusted Firestore config se
+      // cached summary cost khud read karta hai.
+      const requiredCredits =
+        config.cachedSummaryCreditCost;
+
+      if (
+        !Number.isInteger(requiredCredits) ||
+        requiredCredits <= 0
+      ) {
+        throw new Error(
+          'INVALID_CACHED_SUMMARY_COST'
+        );
+      }
+
+      // -------------------------------
+      // ATOMIC SERVER CREDIT CHARGE
+      // -------------------------------
+
+      const reservation =
+        await reserveCredits({
+          uid,
+          requiredCredits,
+          config,
+        });
+
+      if (!reservation.allowed) {
+        return res.status(402).json({
+          success: false,
+          code: 'NOT_ENOUGH_CREDITS',
+          error: reservation.isPremium
+            ? 'Daily premium AI limit reached.'
+            : 'Not enough AI credits.',
+          requiredCredits,
+          availableCredits:
+            reservation.availableCredits,
+          isPremium:
+            reservation.isPremium,
+        });
+      }
+
+      reservedCredits =
+        requiredCredits;
+
+      // -------------------------------
+      // USAGE LOG
+      // -------------------------------
+
+      await saveAiUsage({
+        uid,
+        pdfName,
+        pdfHash,
+        pageCount: parsedPageCount,
+        creditsCharged:
+          requiredCredits,
+        summaryType,
+        fromCache: true,
+      });
+
+      const currentCredits =
+        await getCurrentCreditState(uid);
+
+      return res.status(200).json({
+        success: true,
+        creditsCharged:
+          requiredCredits,
+        availableCredits:
+          currentCredits.availableCredits,
+        isPremium:
+          currentCredits.isPremium,
+      });
+    } catch (error) {
+      // Usage logging/backend failure ke case me
+      // reserved credit wapas kar denge.
+      if (
+        uid &&
+        reservedCredits > 0
+      ) {
+        try {
+          await refundCredits({
+            uid,
+            credits:
+              reservedCredits,
+          });
+        } catch (_) {}
+      }
+
+      if (
+        error.statusCode === 401
+      ) {
+        return res.status(401).json({
+          success: false,
+          error:
+            'Authentication required.',
+        });
+      }
+
+      console.error(
+        'Cached summary credit error:',
+        error?.message ||
+          'UNKNOWN_ERROR'
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          'Cached summary could not be authorised. Your credits were not charged.',
+      });
+    }
+  }
+);
 
 // ======================================================
 // NEW SECURE AI SUMMARY ROUTE
@@ -930,6 +1120,7 @@ app.post(
         creditsCharged:
           requiredCredits,
         summaryType,
+        fromCache: false,
       });
 
       const currentCredits =
@@ -946,8 +1137,6 @@ app.post(
           currentCredits.isPremium,
       });
     } catch (error) {
-      // Gemini/backend failure hua AFTER reservation,
-      // to user ke credits safely refund karenge.
       if (
         uid &&
         reservedCredits > 0
@@ -1003,7 +1192,6 @@ app.post(
 // Temporarily preserve current app compatibility.
 // Flutter migrate hone ke baad is route ko REMOVE karenge.
 // ======================================================
-
 app.post(
   '/summarize',
   summarizeLimiter,
@@ -1033,8 +1221,7 @@ app.post(
       if (
         typeof text !== 'string' ||
         text.trim().length === 0 ||
-        typeof summaryType !==
-          'string' ||
+        typeof summaryType !== 'string' ||
         summaryType.trim().length === 0
       ) {
         return res.status(400).json({
