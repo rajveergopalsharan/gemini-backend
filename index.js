@@ -17,20 +17,41 @@ admin.initializeApp({
 const db = admin.firestore();
 const app = express();
 
-// Existing AI flow ko abhi break nahi karna,
-// isliye current body limit same rakha hai.
-// AI security migration me ise baad me safely reduce karenge.
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// 100-page PDF text ke liye enough,
+// lekin abusive 50 MB requests allow nahi karenge.
+app.use(express.json({ limit: '3mb' }));
+app.use(express.urlencoded({ limit: '3mb', extended: true }));
+
+// ======================================================
+// CONSTANTS
+// ======================================================
+
+const MAX_TEXT_CHARS = 750000;
+
+const ALLOWED_SUMMARY_TYPES = new Set([
+  'Short Summary',
+  'Detailed Summary',
+  'Key Points',
+  'Student Notes',
+]);
+
+// Server-owned daily reset.
+// Device clock ko trust nahi kiya jayega.
+//
+// Abhi India timezone use kar rahe hain so reset
+// midnight India time par deterministic rahega.
+const DAILY_RESET_TIME_ZONE = 'Asia/Kolkata';
 
 // ======================================================
 // RATE LIMITERS
 // ======================================================
 
 const summarizeLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,
+  windowMs: 60 * 1000,
   max: 5,
-  message: { error: 'Please try again in one minute.' },
+  message: {
+    error: 'Too many AI requests. Please try again in one minute.',
+  },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -39,14 +60,15 @@ const deleteAccountLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 3,
   message: {
-    error: 'Too many account deletion attempts. Please try again later.',
+    error:
+      'Too many account deletion attempts. Please try again later.',
   },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
 // ======================================================
-// AUTH HELPER
+// AUTH HELPERS
 // ======================================================
 
 function getBearerToken(req) {
@@ -64,93 +86,1030 @@ function getBearerToken(req) {
   return token.length > 0 ? token : null;
 }
 
-// ======================================================
-// EXISTING AI SUMMARY ROUTE
-// ======================================================
+async function authenticateRequest(req) {
+  const token = getBearerToken(req);
 
-app.post('/summarize', summarizeLimiter, async (req, res) => {
-  const clientToken = getBearerToken(req);
-
-  if (!clientToken) {
-    return res.status(403).json({
-      error: 'Unauthorized request.',
-    });
+  if (!token) {
+    const error = new Error('AUTH_REQUIRED');
+    error.statusCode = 401;
+    throw error;
   }
 
   try {
-    // Firebase token verify
-    await admin.auth().verifyIdToken(clientToken);
+    return await admin.auth().verifyIdToken(token);
+  } catch (_) {
+    const error = new Error('INVALID_AUTH');
+    error.statusCode = 401;
+    throw error;
+  }
+}
 
-    const { text, summaryType } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY;
+// ======================================================
+// SERVER DATE
+// ======================================================
 
-    if (
-      typeof text !== 'string' ||
-      text.trim().isEmpty ||
-      typeof summaryType !== 'string' ||
-      summaryType.trim().isEmpty
-    ) {
-      return res.status(400).json({
-        error: 'Invalid request.',
-      });
-    }
+function getServerDateKey() {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: DAILY_RESET_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
 
-    if (!apiKey) {
-      return res.status(500).json({
-        error: 'AI service is unavailable.',
-      });
-    }
+  return formatter.format(new Date());
+}
 
-    const prompt =
-      `Please provide a ${summaryType} for the following text:\n\n${text}`;
+// ======================================================
+// CONFIG
+// ======================================================
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-        }),
+function defaultCreditRules() {
+  return [
+    { minPages: 1, maxPages: 15, credits: 1 },
+    { minPages: 16, maxPages: 35, credits: 2 },
+    { minPages: 36, maxPages: 60, credits: 3 },
+    { minPages: 61, maxPages: 100, credits: 6 },
+  ];
+}
+
+function defaultRevenueConfig() {
+  return {
+    freeDailyCredits: 2,
+    rewardedAdCreditValue: 1,
+    premiumDailyCredits: 22,
+    maxPdfPagesV1: 100,
+    cachedSummaryCreditCost: 1,
+    maintenanceMode: false,
+    creditRules: defaultCreditRules(),
+  };
+}
+
+function normalizePositiveInt(value, fallback) {
+  const number = Number(value);
+
+  if (!Number.isInteger(number) || number < 0) {
+    return fallback;
+  }
+
+  return number;
+}
+
+function normalizeCreditRules(rawRules) {
+  if (!Array.isArray(rawRules)) {
+    return defaultCreditRules();
+  }
+
+  const normalized = rawRules
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+
+      const minPages = Number(item.minPages);
+      const maxPages = Number(item.maxPages);
+      const credits = Number(item.credits);
+
+      if (
+        !Number.isInteger(minPages) ||
+        !Number.isInteger(maxPages) ||
+        !Number.isInteger(credits) ||
+        minPages <= 0 ||
+        maxPages < minPages ||
+        credits <= 0
+      ) {
+        return null;
       }
+
+      return {
+        minPages,
+        maxPages,
+        credits,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.minPages - b.minPages);
+
+  return normalized.length > 0
+    ? normalized
+    : defaultCreditRules();
+}
+
+async function loadRevenueConfig() {
+  const fallback = defaultRevenueConfig();
+
+  try {
+    const snapshot = await db
+      .collection('appConfig')
+      .doc('revenue')
+      .get();
+
+    if (!snapshot.exists) {
+      return fallback;
+    }
+
+    const data = snapshot.data() || {};
+
+    return {
+      freeDailyCredits: normalizePositiveInt(
+        data.freeDailyCredits,
+        fallback.freeDailyCredits
+      ),
+
+      rewardedAdCreditValue: normalizePositiveInt(
+        data.rewardedAdCreditValue,
+        fallback.rewardedAdCreditValue
+      ),
+
+      premiumDailyCredits: normalizePositiveInt(
+        data.premiumDailyCredits,
+        fallback.premiumDailyCredits
+      ),
+
+      maxPdfPagesV1: normalizePositiveInt(
+        data.maxPdfPagesV1,
+        fallback.maxPdfPagesV1
+      ),
+
+      cachedSummaryCreditCost: normalizePositiveInt(
+        data.cachedSummaryCreditCost,
+        fallback.cachedSummaryCreditCost
+      ),
+
+      maintenanceMode: data.maintenanceMode === true,
+
+      creditRules: normalizeCreditRules(data.creditRules),
+    };
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function calculateFreshSummaryCredits(config, pageCount) {
+  for (const rule of config.creditRules) {
+    if (
+      pageCount >= rule.minPages &&
+      pageCount <= rule.maxPages
+    ) {
+      return rule.credits;
+    }
+  }
+
+  throw new Error('INVALID_PAGE_COUNT');
+}
+
+// ======================================================
+// PREMIUM ENTITLEMENT
+// ======================================================
+
+async function loadServerVerifiedSubscription(uid) {
+  const snapshot = await db
+    .collection('users')
+    .doc(uid)
+    .collection('subscription')
+    .doc('current')
+    .get();
+
+  if (!snapshot.exists) {
+    return {
+      active: false,
+      dailyCredits: 0,
+    };
+  }
+
+  const data = snapshot.data() || {};
+
+  // IMPORTANT:
+  // Client-created subscription documents are NOT trusted.
+  //
+  // Later Google Play backend verification will set:
+  //
+  // verifiedByServer: true
+  //
+  // Current old/client premium docs therefore cannot create
+  // server-authoritative premium entitlement.
+  if (data.verifiedByServer !== true) {
+    return {
+      active: false,
+      dailyCredits: 0,
+    };
+  }
+
+  if (data.status !== 'active') {
+    return {
+      active: false,
+      dailyCredits: 0,
+    };
+  }
+
+  let expiryDate = null;
+
+  if (
+    data.expiryDate &&
+    typeof data.expiryDate.toDate === 'function'
+  ) {
+    expiryDate = data.expiryDate.toDate();
+  }
+
+  if (expiryDate && expiryDate.getTime() <= Date.now()) {
+    return {
+      active: false,
+      dailyCredits: 0,
+    };
+  }
+
+  const dailyCredits = Number(data.dailyCredits);
+
+  if (
+    !Number.isInteger(dailyCredits) ||
+    dailyCredits <= 0
+  ) {
+    return {
+      active: false,
+      dailyCredits: 0,
+    };
+  }
+
+  return {
+    active: true,
+    dailyCredits,
+  };
+}
+
+// ======================================================
+// CREDIT STATE
+// ======================================================
+
+function createFreeState(config, today) {
+  return {
+    baseCreditsToday: config.freeDailyCredits,
+    adCreditsToday: 0,
+    premiumCreditsToday: 0,
+    usedCreditsToday: 0,
+    rewardedAdsWatchedToday: 0,
+    dailyLimitDate: today,
+  };
+}
+
+function createPremiumState(premiumDailyCredits, today) {
+  return {
+    baseCreditsToday: 0,
+    adCreditsToday: 0,
+    premiumCreditsToday: premiumDailyCredits,
+    usedCreditsToday: 0,
+    rewardedAdsWatchedToday: 0,
+    dailyLimitDate: today,
+  };
+}
+
+function normalizeCreditState(data) {
+  return {
+    baseCreditsToday: normalizePositiveInt(
+      data?.baseCreditsToday,
+      0
+    ),
+
+    adCreditsToday: normalizePositiveInt(
+      data?.adCreditsToday,
+      0
+    ),
+
+    premiumCreditsToday: normalizePositiveInt(
+      data?.premiumCreditsToday,
+      0
+    ),
+
+    usedCreditsToday: normalizePositiveInt(
+      data?.usedCreditsToday,
+      0
+    ),
+
+    rewardedAdsWatchedToday: normalizePositiveInt(
+      data?.rewardedAdsWatchedToday,
+      0
+    ),
+
+    dailyLimitDate:
+      typeof data?.dailyLimitDate === 'string'
+        ? data.dailyLimitDate
+        : '',
+  };
+}
+
+function availableCredits(state, isPremium) {
+  if (isPremium) {
+    return Math.max(
+      0,
+      state.premiumCreditsToday -
+        state.usedCreditsToday
+    );
+  }
+
+  return Math.max(
+    0,
+    state.baseCreditsToday +
+      state.adCreditsToday -
+      state.usedCreditsToday
+  );
+}
+
+async function getCurrentCreditState(uid) {
+  const config = await loadRevenueConfig();
+  const subscription =
+    await loadServerVerifiedSubscription(uid);
+
+  const today = getServerDateKey();
+
+  const creditRef = db
+    .collection('users')
+    .doc(uid)
+    .collection('creditState')
+    .doc('current');
+
+  let finalState;
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(creditRef);
+
+    let state;
+
+    if (!snapshot.exists) {
+      state = subscription.active
+        ? createPremiumState(
+            subscription.dailyCredits,
+            today
+          )
+        : createFreeState(config, today);
+    } else {
+      state = normalizeCreditState(snapshot.data());
+
+      if (state.dailyLimitDate !== today) {
+        state = subscription.active
+          ? createPremiumState(
+              subscription.dailyCredits,
+              today
+            )
+          : createFreeState(config, today);
+      } else if (subscription.active) {
+        state.premiumCreditsToday =
+          subscription.dailyCredits;
+        state.baseCreditsToday = 0;
+      }
+    }
+
+    transaction.set(
+      creditRef,
+      {
+        ...state,
+        updatedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
     );
 
-    const data = await response.json();
+    finalState = state;
+  });
 
-    if (!response.ok) {
-      return res.status(500).json({
-        error: 'AI service failed. Please try again.',
-      });
+  return {
+    isPremium: subscription.active,
+    state: finalState,
+    availableCredits: availableCredits(
+      finalState,
+      subscription.active
+    ),
+  };
+}
+
+// ======================================================
+// ATOMIC CREDIT RESERVATION
+// ======================================================
+
+async function reserveCredits({
+  uid,
+  requiredCredits,
+  config,
+}) {
+  const subscription =
+    await loadServerVerifiedSubscription(uid);
+
+  const today = getServerDateKey();
+
+  const creditRef = db
+    .collection('users')
+    .doc(uid)
+    .collection('creditState')
+    .doc('current');
+
+  let result = null;
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(creditRef);
+
+    let state;
+
+    if (!snapshot.exists) {
+      state = subscription.active
+        ? createPremiumState(
+            subscription.dailyCredits,
+            today
+          )
+        : createFreeState(config, today);
+    } else {
+      state = normalizeCreditState(snapshot.data());
+
+      if (state.dailyLimitDate !== today) {
+        state = subscription.active
+          ? createPremiumState(
+              subscription.dailyCredits,
+              today
+            )
+          : createFreeState(config, today);
+      } else if (subscription.active) {
+        state.premiumCreditsToday =
+          subscription.dailyCredits;
+        state.baseCreditsToday = 0;
+      }
     }
 
-    const summary =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const before = availableCredits(
+      state,
+      subscription.active
+    );
 
-    if (typeof summary !== 'string' || summary.trim().length === 0) {
-      return res.status(500).json({
-        error: 'AI response was empty. Please try again.',
-      });
+    if (before < requiredCredits) {
+      transaction.set(
+        creditRef,
+        {
+          ...state,
+          updatedAt:
+            admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      result = {
+        allowed: false,
+        isPremium: subscription.active,
+        availableCredits: before,
+      };
+
+      return;
     }
+
+    state.usedCreditsToday += requiredCredits;
+
+    const after = availableCredits(
+      state,
+      subscription.active
+    );
+
+    transaction.set(
+      creditRef,
+      {
+        ...state,
+        updatedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    result = {
+      allowed: true,
+      isPremium: subscription.active,
+      availableCredits: after,
+    };
+  });
+
+  return result;
+}
+
+// ======================================================
+// REFUND
+// ======================================================
+
+async function refundCredits({
+  uid,
+  credits,
+}) {
+  if (!Number.isInteger(credits) || credits <= 0) {
+    return;
+  }
+
+  const creditRef = db
+    .collection('users')
+    .doc(uid)
+    .collection('creditState')
+    .doc('current');
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(creditRef);
+
+    if (!snapshot.exists) {
+      return;
+    }
+
+    const state = normalizeCreditState(
+      snapshot.data()
+    );
+
+    state.usedCreditsToday = Math.max(
+      0,
+      state.usedCreditsToday - credits
+    );
+
+    transaction.set(
+      creditRef,
+      {
+        ...state,
+        updatedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+// ======================================================
+// USAGE LOG
+// ======================================================
+
+async function saveAiUsage({
+  uid,
+  pdfName,
+  pdfHash,
+  pageCount,
+  creditsCharged,
+  summaryType,
+}) {
+  const safeName =
+    typeof pdfName === 'string'
+      ? pdfName.substring(0, 250)
+      : '';
+
+  const safeHash =
+    typeof pdfHash === 'string'
+      ? pdfHash.substring(0, 500)
+      : '';
+
+  await db
+    .collection('users')
+    .doc(uid)
+    .collection('aiUsage')
+    .add({
+      pdfName: safeName,
+      pdfHash: safeHash,
+      pageCount,
+      creditsCharged,
+      fromCache: false,
+      summaryType,
+      createdAt:
+        admin.firestore.FieldValue.serverTimestamp(),
+    });
+}
+
+// ======================================================
+// CREDIT INFO ENDPOINT
+// ======================================================
+
+app.get('/credits', async (req, res) => {
+  try {
+    const decodedToken =
+      await authenticateRequest(req);
+
+    const creditInfo =
+      await getCurrentCreditState(
+        decodedToken.uid
+      );
 
     return res.status(200).json({
-      summary: summary,
+      success: true,
+      isPremium: creditInfo.isPremium,
+      availableCredits:
+        creditInfo.availableCredits,
     });
-  } catch (_) {
-    return res.status(403).json({
-      error: 'Invalid authentication or request.',
-    });
+  } catch (error) {
+    return res
+      .status(error.statusCode || 500)
+      .json({
+        success: false,
+        error:
+          error.message === 'AUTH_REQUIRED' ||
+          error.message === 'INVALID_AUTH'
+            ? 'Authentication required.'
+            : 'Unable to load credits.',
+      });
   }
 });
+
+// ======================================================
+// NEW SECURE AI SUMMARY ROUTE
+// ======================================================
+
+app.post(
+  '/summarize-secure',
+  summarizeLimiter,
+  async (req, res) => {
+    let uid = null;
+    let reservedCredits = 0;
+
+    try {
+      const decodedToken =
+        await authenticateRequest(req);
+
+      uid = decodedToken.uid;
+
+      const {
+        text,
+        summaryType,
+        pageCount,
+        pdfName,
+        pdfHash,
+      } = req.body || {};
+
+      // -------------------------------
+      // INPUT VALIDATION
+      // -------------------------------
+
+      if (
+        typeof text !== 'string' ||
+        text.trim().length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_TEXT',
+          error: 'PDF text is missing.',
+        });
+      }
+
+      if (text.length > MAX_TEXT_CHARS) {
+        return res.status(413).json({
+          success: false,
+          code: 'PDF_TOO_LARGE',
+          error:
+            'This PDF is too large for AI Summary.',
+        });
+      }
+
+      if (
+        typeof summaryType !== 'string' ||
+        !ALLOWED_SUMMARY_TYPES.has(
+          summaryType
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_SUMMARY_TYPE',
+          error: 'Invalid summary type.',
+        });
+      }
+
+      const parsedPageCount =
+        Number(pageCount);
+
+      if (
+        !Number.isInteger(parsedPageCount) ||
+        parsedPageCount <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PAGE_COUNT',
+          error: 'Invalid PDF page count.',
+        });
+      }
+
+      // -------------------------------
+      // CONFIG
+      // -------------------------------
+
+      const config =
+        await loadRevenueConfig();
+
+      if (config.maintenanceMode) {
+        return res.status(503).json({
+          success: false,
+          code: 'MAINTENANCE',
+          error:
+            'AI service is temporarily unavailable.',
+        });
+      }
+
+      if (
+        parsedPageCount >
+        config.maxPdfPagesV1
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'PDF_TOO_LARGE',
+          error:
+            'This PDF is too large for AI Summary in V1.',
+        });
+      }
+
+      // -------------------------------
+      // SERVER CALCULATES COST
+      // -------------------------------
+
+      const requiredCredits =
+        calculateFreshSummaryCredits(
+          config,
+          parsedPageCount
+        );
+
+      // -------------------------------
+      // ATOMIC SERVER RESERVATION
+      // -------------------------------
+
+      const reservation =
+        await reserveCredits({
+          uid,
+          requiredCredits,
+          config,
+        });
+
+      if (!reservation.allowed) {
+        return res.status(402).json({
+          success: false,
+          code: 'NOT_ENOUGH_CREDITS',
+          error: reservation.isPremium
+            ? 'Daily premium AI limit reached.'
+            : 'Not enough AI credits.',
+          requiredCredits,
+          availableCredits:
+            reservation.availableCredits,
+          isPremium:
+            reservation.isPremium,
+        });
+      }
+
+      reservedCredits =
+        requiredCredits;
+
+      // -------------------------------
+      // GEMINI
+      // -------------------------------
+
+      const apiKey =
+        process.env.GEMINI_API_KEY;
+
+      if (!apiKey) {
+        throw new Error(
+          'AI_SERVICE_UNAVAILABLE'
+        );
+      }
+
+      const prompt =
+        `Please provide a ${summaryType} ` +
+        `for the following text:\n\n${text}`;
+
+      const geminiController =
+        new AbortController();
+
+      const timeout = setTimeout(
+        () => geminiController.abort(),
+        60 * 1000
+      );
+
+      let geminiResponse;
+
+      try {
+        geminiResponse = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            signal:
+              geminiController.signal,
+            headers: {
+              'Content-Type':
+                'application/json',
+            },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    {
+                      text: prompt,
+                    },
+                  ],
+                },
+              ],
+            }),
+          }
+        );
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const data =
+        await geminiResponse.json();
+
+      if (!geminiResponse.ok) {
+        throw new Error(
+          'GEMINI_REQUEST_FAILED'
+        );
+      }
+
+      const summary =
+        data?.candidates?.[0]?.content
+          ?.parts?.[0]?.text;
+
+      if (
+        typeof summary !== 'string' ||
+        summary.trim().length === 0
+      ) {
+        throw new Error(
+          'EMPTY_AI_RESPONSE'
+        );
+      }
+
+      // -------------------------------
+      // USAGE LOG
+      // -------------------------------
+
+      await saveAiUsage({
+        uid,
+        pdfName,
+        pdfHash,
+        pageCount: parsedPageCount,
+        creditsCharged:
+          requiredCredits,
+        summaryType,
+      });
+
+      const currentCredits =
+        await getCurrentCreditState(uid);
+
+      return res.status(200).json({
+        success: true,
+        summary: summary.trim(),
+        creditsCharged:
+          requiredCredits,
+        availableCredits:
+          currentCredits.availableCredits,
+        isPremium:
+          currentCredits.isPremium,
+      });
+    } catch (error) {
+      // Gemini/backend failure hua AFTER reservation,
+      // to user ke credits safely refund karenge.
+      if (
+        uid &&
+        reservedCredits > 0
+      ) {
+        try {
+          await refundCredits({
+            uid,
+            credits:
+              reservedCredits,
+          });
+        } catch (_) {}
+      }
+
+      if (
+        error.name === 'AbortError'
+      ) {
+        return res.status(504).json({
+          success: false,
+          error:
+            'AI request timed out. Your credits were not charged.',
+        });
+      }
+
+      if (
+        error.statusCode === 401
+      ) {
+        return res.status(401).json({
+          success: false,
+          error:
+            'Authentication required.',
+        });
+      }
+
+      console.error(
+        'Secure AI error:',
+        error?.message ||
+          'UNKNOWN_ERROR'
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          'AI summary could not be generated. Your credits were not charged.',
+      });
+    }
+  }
+);
+
+// ======================================================
+// OLD AI ROUTE
+//
+// IMPORTANT:
+// Temporarily preserve current app compatibility.
+// Flutter migrate hone ke baad is route ko REMOVE karenge.
+// ======================================================
+
+app.post(
+  '/summarize',
+  summarizeLimiter,
+  async (req, res) => {
+    const clientToken =
+      getBearerToken(req);
+
+    if (!clientToken) {
+      return res.status(403).json({
+        error: 'Unauthorized request.',
+      });
+    }
+
+    try {
+      await admin
+        .auth()
+        .verifyIdToken(clientToken);
+
+      const {
+        text,
+        summaryType,
+      } = req.body;
+
+      const apiKey =
+        process.env.GEMINI_API_KEY;
+
+      if (
+        typeof text !== 'string' ||
+        text.trim().length === 0 ||
+        typeof summaryType !==
+          'string' ||
+        summaryType.trim().length === 0
+      ) {
+        return res.status(400).json({
+          error: 'Invalid request.',
+        });
+      }
+
+      if (!apiKey) {
+        return res.status(500).json({
+          error:
+            'AI service is unavailable.',
+        });
+      }
+
+      const prompt =
+        `Please provide a ${summaryType} ` +
+        `for the following text:\n\n${text}`;
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type':
+              'application/json',
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  {
+                    text: prompt,
+                  },
+                ],
+              },
+            ],
+          }),
+        }
+      );
+
+      const data =
+        await response.json();
+
+      if (!response.ok) {
+        return res.status(500).json({
+          error:
+            'AI service failed. Please try again.',
+        });
+      }
+
+      const summary =
+        data?.candidates?.[0]?.content
+          ?.parts?.[0]?.text;
+
+      if (
+        typeof summary !== 'string' ||
+        summary.trim().length === 0
+      ) {
+        return res.status(500).json({
+          error:
+            'AI response was empty. Please try again.',
+        });
+      }
+
+      return res.status(200).json({
+        summary,
+      });
+    } catch (_) {
+      return res.status(403).json({
+        error:
+          'Invalid authentication or request.',
+      });
+    }
+  }
+);
 
 // ======================================================
 // SECURE ACCOUNT DELETION
@@ -160,89 +1119,90 @@ app.post(
   '/delete-account',
   deleteAccountLimiter,
   async (req, res) => {
-    const clientToken = getBearerToken(req);
+    const clientToken =
+      getBearerToken(req);
 
     if (!clientToken) {
       return res.status(401).json({
-        error: 'Authentication required.',
+        error:
+          'Authentication required.',
       });
     }
 
     try {
-      // true = revoked/disabled session bhi reject hoga
       const decodedToken =
-        await admin.auth().verifyIdToken(clientToken, true);
+        await admin
+          .auth()
+          .verifyIdToken(
+            clientToken,
+            true
+          );
 
-      // IMPORTANT:
-      // UID body/query se nahi liya ja raha.
-      // Verified Firebase token hi user decide karega.
-      const uid = decodedToken.uid;
+      const uid =
+        decodedToken.uid;
 
       if (!uid) {
         return res.status(401).json({
-          error: 'Invalid authentication.',
+          error:
+            'Invalid authentication.',
         });
       }
 
-      // Sensitive action: recent Google/Firebase authentication required.
-      // auth_time seconds me hota hai.
-      const authTime = decodedToken.auth_time;
-      const nowSeconds = Math.floor(Date.now() / 1000);
+      const authTime =
+        decodedToken.auth_time;
+
+      const nowSeconds =
+        Math.floor(Date.now() / 1000);
 
       if (
         typeof authTime !== 'number' ||
-        nowSeconds - authTime > 5 * 60
+        nowSeconds - authTime >
+          5 * 60
       ) {
         return res.status(401).json({
-          code: 'RECENT_LOGIN_REQUIRED',
-          error: 'Please sign in again before deleting your account.',
+          code:
+            'RECENT_LOGIN_REQUIRED',
+          error:
+            'Please sign in again before deleting your account.',
         });
       }
 
-      // --------------------------------------------------
-      // 1. Delete all Firestore data under users/{uid}
-      // including nested subcollections such as:
-      // creditState, aiUsage, subscription, purchases, etc.
-      // --------------------------------------------------
+      const userRef = db
+        .collection('users')
+        .doc(uid);
 
-      const userRef = db.collection('users').doc(uid);
+      await db.recursiveDelete(
+        userRef
+      );
 
-      await db.recursiveDelete(userRef);
+      await db
+        .collection(
+          'ai_daily_limits'
+        )
+        .doc(uid)
+        .delete();
 
-      // --------------------------------------------------
-      // 2. Delete old legacy AI daily-limit document
-      // if one happens to exist.
-      // --------------------------------------------------
-
-      const oldDailyLimitRef =
-        db.collection('ai_daily_limits').doc(uid);
-
-      await oldDailyLimitRef.delete();
-
-      // --------------------------------------------------
-      // 3. Delete Firebase Authentication user LAST.
-      //
-      // Data pehle delete karte hain, Auth baad me.
-      // Agar data deletion fail ho to user authenticated
-      // rehkar safely retry kar sakta hai.
-      // --------------------------------------------------
-
-      await admin.auth().deleteUser(uid);
+      await admin
+        .auth()
+        .deleteUser(uid);
 
       return res.status(200).json({
         success: true,
-        message: 'Account and associated data deleted successfully.',
+        message:
+          'Account and associated data deleted successfully.',
       });
     } catch (error) {
-      // Sensitive token/UID/document data logs me print nahi kar rahe.
       console.error(
         'Account deletion failed:',
-        error?.code || error?.name || 'UNKNOWN_ERROR'
+        error?.code ||
+          error?.name ||
+          'UNKNOWN_ERROR'
       );
 
       return res.status(500).json({
         success: false,
-        error: 'Account deletion could not be completed. Please try again.',
+        error:
+          'Account deletion could not be completed. Please try again.',
       });
     }
   }
@@ -254,7 +1214,8 @@ app.post(
 
 app.get('/', (req, res) => {
   return res.status(200).json({
-    service: 'Rajveon Docs Backend',
+    service:
+      'Rajveon Docs Backend',
     status: 'running',
   });
 });
@@ -263,8 +1224,11 @@ app.get('/', (req, res) => {
 // SERVER
 // ======================================================
 
-const PORT = process.env.PORT || 10000;
+const PORT =
+  process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-  console.log(`Rajveon Docs backend running on port ${PORT}`);
+  console.log(
+    `Rajveon Docs backend running on port ${PORT}`
+  );
 });
