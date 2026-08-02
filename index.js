@@ -149,10 +149,6 @@ async function verifyAdMobSsvRequest(req) {
   const originalUrl =
     req.originalUrl;
 
-  console.log(
-    'ADMOB_SSV_RAW_URL:',
-    originalUrl
-  );
 
   const questionIndex =
     originalUrl.indexOf('?');
@@ -272,8 +268,15 @@ async function verifyAdMobSsvRequest(req) {
       'SHA256'
     );
 
+  // Google/Tink verifies the URI-decoded query content.
+  // Example: AI%20Credit must be verified as "AI Credit".
+  const decodedSignedContent =
+    decodeURIComponent(
+      signedContent
+    );
+
   verifier.update(
-    signedContent,
+    decodedSignedContent,
     'utf8'
   );
 
