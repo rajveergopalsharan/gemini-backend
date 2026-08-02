@@ -1,6 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 
 // ======================================================
 // FIREBASE ADMIN
@@ -15,7 +16,303 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+
 const app = express();
+
+// ======================================================
+// ADMOB REWARDED SSV SECURITY
+// ======================================================
+
+const ADMOB_REWARDED_AD_UNIT_ID =
+  'ca-app-pub-9269597231385928/6505738136';
+
+const ADMOB_REWARDED_AD_UNIT_SUFFIX =
+  '6505738136';
+
+const ADMOB_REWARD_ITEM =
+  'AI Credit';
+
+const ADMOB_PUBLIC_KEYS_URL =
+  'https://www.gstatic.com/admob/reward/verifier-keys.json';
+
+// Google rotates verification keys.
+// Keep cache safely below Google's 24-hour maximum guidance.
+const ADMOB_KEYS_CACHE_MS =
+  12 * 60 * 60 * 1000;
+
+let admobVerificationKeys =
+  new Map();
+
+let admobKeysLoadedAt = 0;
+
+async function loadAdMobVerificationKeys({
+  forceRefresh = false,
+} = {}) {
+  const now = Date.now();
+
+  if (
+    !forceRefresh &&
+    admobVerificationKeys.size > 0 &&
+    now - admobKeysLoadedAt <
+      ADMOB_KEYS_CACHE_MS
+  ) {
+    return admobVerificationKeys;
+  }
+
+  const response =
+    await fetch(
+      ADMOB_PUBLIC_KEYS_URL
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      'ADMOB_KEYS_UNAVAILABLE'
+    );
+  }
+
+  const data =
+    await response.json();
+
+  if (
+    !data ||
+    !Array.isArray(data.keys)
+  ) {
+    throw new Error(
+      'ADMOB_KEYS_INVALID'
+    );
+  }
+
+  const freshKeys =
+    new Map();
+
+  for (const key of data.keys) {
+    const keyId =
+      String(key.keyId ?? '');
+
+    const pem =
+      typeof key.pem === 'string'
+        ? key.pem
+        : '';
+
+    if (
+      keyId &&
+      pem.includes(
+        'BEGIN PUBLIC KEY'
+      )
+    ) {
+      freshKeys.set(
+        keyId,
+        pem
+      );
+    }
+  }
+
+  if (freshKeys.size === 0) {
+    throw new Error(
+      'ADMOB_KEYS_EMPTY'
+    );
+  }
+
+  admobVerificationKeys =
+    freshKeys;
+
+  admobKeysLoadedAt =
+    now;
+
+  return admobVerificationKeys;
+}
+
+function decodeAdMobBase64Url(value) {
+  const normalized =
+    value
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
+
+  const remainder =
+    normalized.length % 4;
+
+  const padded =
+    remainder === 0
+      ? normalized
+      : normalized +
+        '='.repeat(
+          4 - remainder
+        );
+
+  return Buffer.from(
+    padded,
+    'base64'
+  );
+}
+
+async function verifyAdMobSsvRequest(req) {
+  const originalUrl =
+    req.originalUrl;
+
+  const questionIndex =
+    originalUrl.indexOf('?');
+
+  if (questionIndex < 0) {
+    throw new Error(
+      'SSV_QUERY_MISSING'
+    );
+  }
+
+  // IMPORTANT:
+  // Do not reconstruct/reorder query parameters.
+  // Google's signature covers the exact original query
+  // content before "&signature=".
+  const rawQuery =
+    originalUrl.substring(
+      questionIndex + 1
+    );
+
+  const signatureMarker =
+    '&signature=';
+
+  const signatureIndex =
+    rawQuery.lastIndexOf(
+      signatureMarker
+    );
+
+  if (signatureIndex < 0) {
+    throw new Error(
+      'SSV_SIGNATURE_MISSING'
+    );
+  }
+
+  const signedContent =
+    rawQuery.substring(
+      0,
+      signatureIndex
+    );
+
+  const signatureSection =
+    rawQuery.substring(
+      signatureIndex +
+        signatureMarker.length
+    );
+
+  const keyMarker =
+    '&key_id=';
+
+  const keyIndex =
+    signatureSection.lastIndexOf(
+      keyMarker
+    );
+
+  if (keyIndex < 0) {
+    throw new Error(
+      'SSV_KEY_ID_MISSING'
+    );
+  }
+
+  const encodedSignature =
+    signatureSection.substring(
+      0,
+      keyIndex
+    );
+
+  const encodedKeyId =
+    signatureSection.substring(
+      keyIndex +
+        keyMarker.length
+    );
+
+  const signatureText =
+    decodeURIComponent(
+      encodedSignature
+    );
+
+  const keyId =
+    decodeURIComponent(
+      encodedKeyId
+    );
+
+  if (
+    !signatureText ||
+    !keyId
+  ) {
+    throw new Error(
+      'SSV_SIGNATURE_INVALID'
+    );
+  }
+
+  let keys =
+    await loadAdMobVerificationKeys();
+
+  if (!keys.has(keyId)) {
+    keys =
+      await loadAdMobVerificationKeys({
+        forceRefresh: true,
+      });
+  }
+
+  const publicKey =
+    keys.get(keyId);
+
+  if (!publicKey) {
+    throw new Error(
+      'SSV_KEY_NOT_FOUND'
+    );
+  }
+
+  const signature =
+    decodeAdMobBase64Url(
+      signatureText
+    );
+
+  const verifier =
+    crypto.createVerify(
+      'SHA256'
+    );
+
+  verifier.update(
+    signedContent,
+    'utf8'
+  );
+
+  verifier.end();
+
+  const valid =
+    verifier.verify(
+      publicKey,
+      signature
+    );
+
+  if (!valid) {
+    throw new Error(
+      'SSV_SIGNATURE_REJECTED'
+    );
+  }
+
+  return true;
+}
+
+function isExpectedRewardedAdUnit(
+  adUnit
+) {
+  if (
+    typeof adUnit !== 'string' ||
+    adUnit.trim().length === 0
+  ) {
+    return false;
+  }
+
+  const value =
+    adUnit.trim();
+
+  return (
+    value ===
+      ADMOB_REWARDED_AD_UNIT_ID ||
+    value ===
+      ADMOB_REWARDED_AD_UNIT_SUFFIX ||
+    value.endsWith(
+      '/' +
+        ADMOB_REWARDED_AD_UNIT_SUFFIX
+    )
+  );
+}
 
 // 100-page PDF text ke liye enough,
 // lekin abusive 50 MB requests allow nahi karenge.
@@ -571,6 +868,165 @@ async function reserveCredits({
   });
 
   return result;
+}
+
+// ======================================================
+// VERIFIED ADMOB REWARD CREDIT
+//
+// NO daily rewarded-ad limit.
+// Each unique verified AdMob transaction = exactly +1 credit.
+// Duplicate transaction IDs never grant another credit.
+// ======================================================
+
+async function grantVerifiedAdMobReward({
+  uid,
+  transactionId,
+  adUnit,
+  rewardAmount,
+  rewardItem,
+}) {
+  const config =
+    await loadRevenueConfig();
+
+  if (
+    config.rewardedAdCreditValue !== 1
+  ) {
+    throw new Error(
+      'INVALID_REWARDED_AD_CONFIG'
+    );
+  }
+
+  if (
+    !isExpectedRewardedAdUnit(
+      adUnit
+    )
+  ) {
+    throw new Error(
+      'WRONG_AD_UNIT'
+    );
+  }
+
+  if (rewardAmount !== 1) {
+    throw new Error(
+      'WRONG_REWARD_AMOUNT'
+    );
+  }
+
+  if (
+    rewardItem !==
+    ADMOB_REWARD_ITEM
+  ) {
+    throw new Error(
+      'WRONG_REWARD_ITEM'
+    );
+  }
+
+  const today =
+    getServerDateKey();
+
+  const creditRef = db
+    .collection('users')
+    .doc(uid)
+    .collection('creditState')
+    .doc('current');
+
+  // Global transaction ledger.
+  // Firestore client rules do not grant access to this collection.
+  const rewardRef = db
+    .collection(
+      'admobRewardTransactions'
+    )
+    .doc(transactionId);
+
+  let duplicate = false;
+
+  await db.runTransaction(
+    async (transaction) => {
+      // All reads happen before writes.
+      const rewardSnapshot =
+        await transaction.get(
+          rewardRef
+        );
+
+      const creditSnapshot =
+        await transaction.get(
+          creditRef
+        );
+
+      if (
+        rewardSnapshot.exists
+      ) {
+        duplicate = true;
+        return;
+      }
+
+      let state;
+
+      if (
+        !creditSnapshot.exists
+      ) {
+        state =
+          createFreeState(
+            config,
+            today
+          );
+      } else {
+        state =
+          normalizeCreditState(
+            creditSnapshot.data()
+          );
+
+        if (
+          state.dailyLimitDate !==
+          today
+        ) {
+          state =
+            createFreeState(
+              config,
+              today
+            );
+        }
+      }
+
+      state.adCreditsToday +=
+        1;
+
+      state.rewardedAdsWatchedToday +=
+        1;
+
+      transaction.set(
+        creditRef,
+        {
+          ...state,
+          updatedAt:
+            admin.firestore
+              .FieldValue
+              .serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      transaction.create(
+        rewardRef,
+        {
+          uid,
+          transactionId,
+          adUnit,
+          rewardAmount,
+          rewardItem,
+          creditsGranted: 1,
+          createdAt:
+            admin.firestore
+              .FieldValue
+              .serverTimestamp(),
+        }
+      );
+    }
+  );
+
+  return {
+    duplicate,
+  };
 }
 
 // ======================================================
@@ -1184,6 +1640,124 @@ app.post(
     }
   }
 );
+// ======================================================
+// ADMOB REWARDED SSV CALLBACK
+//
+// This endpoint is called by Google AdMob, NOT by Flutter.
+// Client callbacks alone can never grant credits.
+// ======================================================
+
+app.get(
+  '/admob/rewarded-ssv',
+  async (req, res) => {
+    try {
+      // First verify Google's cryptographic signature.
+      await verifyAdMobSsvRequest(
+        req
+      );
+
+      const userId =
+        typeof req.query.user_id ===
+        'string'
+          ? req.query.user_id.trim()
+          : '';
+
+      const transactionId =
+        typeof req.query.transaction_id ===
+        'string'
+          ? req.query.transaction_id.trim()
+          : '';
+
+      const adUnit =
+        typeof req.query.ad_unit ===
+        'string'
+          ? req.query.ad_unit.trim()
+          : '';
+
+      const rewardItem =
+        typeof req.query.reward_item ===
+        'string'
+          ? req.query.reward_item
+          : '';
+
+      const rewardAmount =
+        Number(
+          req.query.reward_amount
+        );
+
+      if (
+        !userId ||
+        !transactionId ||
+        !adUnit ||
+        !Number.isInteger(
+          rewardAmount
+        )
+      ) {
+        return res
+          .status(400)
+          .send(
+            'Invalid SSV request'
+          );
+      }
+
+      // The SSV user_id must correspond to an
+      // actual Firebase Authentication account.
+      try {
+        await admin
+          .auth()
+          .getUser(userId);
+      } catch (error) {
+        if (
+          error?.code ===
+          'auth/user-not-found'
+        ) {
+          // User was deleted after watching the ad.
+          // Return 200 so Google does not keep retrying.
+          return res
+            .status(200)
+            .send(
+              'User no longer exists'
+            );
+        }
+
+        throw error;
+      }
+
+      const result =
+        await grantVerifiedAdMobReward({
+          uid: userId,
+          transactionId,
+          adUnit,
+          rewardAmount,
+          rewardItem,
+        });
+
+      // Google may retry callbacks.
+      // Duplicate transaction IDs still return HTTP 200,
+      // but no second credit is granted.
+      return res
+        .status(200)
+        .send(
+          result.duplicate
+            ? 'Already processed'
+            : 'Reward verified'
+        );
+    } catch (error) {
+      console.error(
+        'AdMob SSV rejected:',
+        error?.message ||
+          'UNKNOWN_ERROR'
+      );
+
+      return res
+        .status(400)
+        .send(
+          'Invalid SSV request'
+        );
+    }
+  }
+);
+
 // ======================================================
 // SECURE ACCOUNT DELETION
 // ======================================================
