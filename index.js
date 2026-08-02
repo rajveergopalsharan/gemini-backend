@@ -149,6 +149,11 @@ async function verifyAdMobSsvRequest(req) {
   const originalUrl =
     req.originalUrl;
 
+  console.log(
+    'ADMOB_SSV_RAW_URL:',
+    originalUrl
+  );
+
   const questionIndex =
     originalUrl.indexOf('?');
 
