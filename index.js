@@ -1686,7 +1686,6 @@ app.get(
         );
 
       if (
-        !userId ||
         !transactionId ||
         !adUnit ||
         !Number.isInteger(
@@ -1697,6 +1696,17 @@ app.get(
           .status(400)
           .send(
             'Invalid SSV request'
+          );
+      }
+
+      // AdMob's URL verification test may omit user_id.
+      // The request is already cryptographically verified,
+      // so return HTTP 200 but NEVER grant a credit.
+      if (!userId) {
+        return res
+          .status(200)
+          .send(
+            'SSV callback URL verified'
           );
       }
 
