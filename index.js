@@ -606,7 +606,17 @@ async function loadServerVerifiedSubscription(uid) {
     expiryDate = data.expiryDate.toDate();
   }
 
-  if (expiryDate && expiryDate.getTime() <= Date.now()) {
+  // Rajveon Docs has NO lifetime subscription.
+  // Every trusted premium entitlement MUST contain
+  // a backend-verified expiry date.
+  if (!expiryDate) {
+    return {
+      active: false,
+      dailyCredits: 0,
+    };
+  }
+
+  if (expiryDate.getTime() <= Date.now()) {
     return {
       active: false,
       dailyCredits: 0,
