@@ -1146,11 +1146,18 @@ app.get('/credits', async (req, res) => {
         decodedToken.uid
       );
 
+    const totalCredits =
+      creditInfo.isPremium
+        ? creditInfo.state.premiumCreditsToday
+        : creditInfo.state.baseCreditsToday +
+          creditInfo.state.adCreditsToday;
+
     return res.status(200).json({
       success: true,
       isPremium: creditInfo.isPremium,
       availableCredits:
         creditInfo.availableCredits,
+      totalCredits,
     });
   } catch (error) {
     return res
