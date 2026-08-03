@@ -2,6 +2,7 @@ const express = require('express');
 const admin = require('firebase-admin');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
+const { google } = require('googleapis');
 
 // ======================================================
 // FIREBASE ADMIN
@@ -1786,6 +1787,619 @@ app.get(
   }
 );
 
+// ======================================================
+// SECURE GOOGLE PLAY SUBSCRIPTION VERIFICATION
+//
+// Flutter can NEVER activate Premium itself.
+// Google Play Developer API is the source of truth.
+// ======================================================
+
+const GOOGLE_PLAY_PACKAGE_NAME =
+  'com.rajveon.rajveondocs';
+
+const GOOGLE_PLAY_CREDENTIALS_PATH =
+  process.env.GOOGLE_PLAY_CREDENTIALS_PATH ||
+  '/etc/secrets/google-play-service-account.json';
+
+const GOOGLE_PLAY_SCOPE =
+  'https://www.googleapis.com/auth/androidpublisher';
+
+const billingVerifyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+let googlePlayPublisherClient = null;
+
+function getGooglePlayPublisherClient() {
+  if (googlePlayPublisherClient) {
+    return googlePlayPublisherClient;
+  }
+
+  const auth =
+    new google.auth.GoogleAuth({
+      keyFile:
+        GOOGLE_PLAY_CREDENTIALS_PATH,
+      scopes: [
+        GOOGLE_PLAY_SCOPE,
+      ],
+    });
+
+  googlePlayPublisherClient =
+    google.androidpublisher({
+      version: 'v3',
+      auth,
+    });
+
+  return googlePlayPublisherClient;
+}
+
+async function loadPremiumPlanByProductId(
+  productId
+) {
+  const snapshot =
+    await db
+      .collection('premium_plans')
+      .where(
+        'productId',
+        '==',
+        productId
+      )
+      .limit(1)
+      .get();
+
+  if (snapshot.empty) {
+    throw new Error(
+      'UNKNOWN_PREMIUM_PRODUCT'
+    );
+  }
+
+  const doc =
+    snapshot.docs[0];
+
+  const data =
+    doc.data() || {};
+
+  if (data.active !== true) {
+    throw new Error(
+      'PREMIUM_PLAN_DISABLED'
+    );
+  }
+
+  const dailyCredits =
+    normalizePositiveInt(
+      data.dailyCredits,
+      0
+    );
+
+  if (dailyCredits <= 0) {
+    throw new Error(
+      'INVALID_PREMIUM_PLAN'
+    );
+  }
+
+  return {
+    id: doc.id,
+    productId:
+      typeof data.productId ===
+      'string'
+        ? data.productId.trim()
+        : '',
+    title:
+      typeof data.title ===
+      'string'
+        ? data.title.trim()
+        : '',
+    priceInr:
+      normalizePositiveInt(
+        data.priceInr,
+        0
+      ),
+    dailyCredits,
+    durationType:
+      typeof data.durationType ===
+      'string'
+        ? data.durationType.trim()
+        : '',
+  };
+}
+
+function findVerifiedSubscriptionLineItem({
+  subscriptionData,
+  productId,
+}) {
+  const lineItems =
+    Array.isArray(
+      subscriptionData?.lineItems
+    )
+      ? subscriptionData.lineItems
+      : [];
+
+  const matchingItems =
+    lineItems.filter(
+      (item) =>
+        item &&
+        item.productId === productId &&
+        typeof item.expiryTime ===
+          'string'
+    );
+
+  if (matchingItems.length === 0) {
+    throw new Error(
+      'PRODUCT_ID_MISMATCH'
+    );
+  }
+
+  let selectedItem = null;
+  let selectedExpiry = null;
+
+  for (const item of matchingItems) {
+    const expiry =
+      new Date(item.expiryTime);
+
+    if (
+      Number.isNaN(
+        expiry.getTime()
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !selectedExpiry ||
+      expiry.getTime() >
+        selectedExpiry.getTime()
+    ) {
+      selectedItem = item;
+      selectedExpiry = expiry;
+    }
+  }
+
+  if (
+    !selectedItem ||
+    !selectedExpiry
+  ) {
+    throw new Error(
+      'INVALID_SUBSCRIPTION_EXPIRY'
+    );
+  }
+
+  return {
+    item: selectedItem,
+    expiryDate: selectedExpiry,
+  };
+}
+
+function subscriptionStateHasEntitlement({
+  subscriptionState,
+  expiryDate,
+}) {
+  if (
+    !(expiryDate instanceof Date) ||
+    Number.isNaN(
+      expiryDate.getTime()
+    ) ||
+    expiryDate.getTime() <=
+      Date.now()
+  ) {
+    return false;
+  }
+
+  // ACTIVE:
+  // Normal paid subscription.
+  //
+  // IN_GRACE_PERIOD:
+  // Google says entitlement must continue.
+  //
+  // CANCELED:
+  // Voluntary cancellation may still retain
+  // entitlement until expiryTime.
+  return (
+    subscriptionState ===
+      'SUBSCRIPTION_STATE_ACTIVE' ||
+    subscriptionState ===
+      'SUBSCRIPTION_STATE_IN_GRACE_PERIOD' ||
+    subscriptionState ===
+      'SUBSCRIPTION_STATE_CANCELED'
+  );
+}
+
+app.post(
+  '/billing/verify-subscription',
+  billingVerifyLimiter,
+  async (req, res) => {
+    let uid = null;
+
+    try {
+      const decoded =
+        await authenticateRequest(req);
+
+      uid = decoded.uid;
+
+      if (!uid) {
+        return res
+          .status(401)
+          .json({
+            success: false,
+            error:
+              'Authentication required.',
+          });
+      }
+
+      const productId =
+        typeof req.body?.productId ===
+        'string'
+          ? req.body.productId.trim()
+          : '';
+
+      const purchaseToken =
+        typeof req.body?.purchaseToken ===
+        'string'
+          ? req.body.purchaseToken.trim()
+          : '';
+
+      if (
+        !productId ||
+        !purchaseToken
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              'Purchase information is incomplete.',
+          });
+      }
+
+      if (
+        productId.length > 200 ||
+        purchaseToken.length > 5000
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              'Invalid purchase information.',
+          });
+      }
+
+      // Product must first exist in our
+      // server-owned Premium plan configuration.
+      const plan =
+        await loadPremiumPlanByProductId(
+          productId
+        );
+
+      if (
+        plan.productId !==
+        productId
+      ) {
+        throw new Error(
+          'PRODUCT_ID_MISMATCH'
+        );
+      }
+
+      const publisher =
+        getGooglePlayPublisherClient();
+
+      // Google Play is the source of truth.
+      const response =
+        await publisher
+          .purchases
+          .subscriptionsv2
+          .get({
+            packageName:
+              GOOGLE_PLAY_PACKAGE_NAME,
+            token:
+              purchaseToken,
+          });
+
+      const subscriptionData =
+        response?.data || {};
+
+      const subscriptionState =
+        typeof subscriptionData
+          .subscriptionState ===
+        'string'
+          ? subscriptionData
+              .subscriptionState
+          : '';
+
+      const verifiedLine =
+        findVerifiedSubscriptionLineItem({
+          subscriptionData,
+          productId,
+        });
+
+      const expiryDate =
+        verifiedLine.expiryDate;
+
+      const entitled =
+        subscriptionStateHasEntitlement({
+          subscriptionState,
+          expiryDate,
+        });
+
+      if (!entitled) {
+        return res
+          .status(403)
+          .json({
+            success: false,
+            error:
+              'Google Play subscription is not currently entitled.',
+            subscriptionState,
+          });
+      }
+
+      const tokenHash =
+        crypto
+          .createHash('sha256')
+          .update(purchaseToken)
+          .digest('hex');
+
+      const tokenRef =
+        db
+          .collection(
+            'googlePlayPurchaseTokens'
+          )
+          .doc(tokenHash);
+
+      const subscriptionRef =
+        db
+          .collection('users')
+          .doc(uid)
+          .collection(
+            'subscription'
+          )
+          .doc('current');
+
+      const purchaseRef =
+        db
+          .collection('users')
+          .doc(uid)
+          .collection('purchases')
+          .doc(tokenHash);
+
+      await db.runTransaction(
+        async (transaction) => {
+          const existingToken =
+            await transaction.get(
+              tokenRef
+            );
+
+          if (
+            existingToken.exists
+          ) {
+            const tokenData =
+              existingToken.data() ||
+              {};
+
+            if (
+              tokenData.uid &&
+              tokenData.uid !== uid
+            ) {
+              throw new Error(
+                'PURCHASE_TOKEN_ALREADY_ASSIGNED'
+              );
+            }
+          }
+
+          // Global server-only token ownership.
+          transaction.set(
+            tokenRef,
+            {
+              uid,
+              productId,
+              packageName:
+                GOOGLE_PLAY_PACKAGE_NAME,
+              tokenHash,
+              updatedAt:
+                admin.firestore
+                  .FieldValue
+                  .serverTimestamp(),
+              createdAt:
+                existingToken.exists
+                  ? existingToken
+                      .data()
+                      ?.createdAt ||
+                    admin.firestore
+                      .FieldValue
+                      .serverTimestamp()
+                  : admin.firestore
+                      .FieldValue
+                      .serverTimestamp(),
+            },
+            {
+              merge: true,
+            }
+          );
+
+          // Server-owned purchase record.
+          // Raw token is intentionally NOT exposed
+          // inside the user's normal purchase document.
+          transaction.set(
+            purchaseRef,
+            {
+              id: tokenHash,
+              productId,
+              planId: plan.id,
+              orderId:
+                subscriptionData
+                  .latestOrderId ||
+                verifiedLine.item
+                  .latestSuccessfulOrderId ||
+                '',
+              purchaseTokenHash:
+                tokenHash,
+              source:
+                'google_play',
+              status: 'active',
+              googleSubscriptionState:
+                subscriptionState,
+              priceInr:
+                plan.priceInr,
+              dailyCredits:
+                plan.dailyCredits,
+              purchaseDate:
+                subscriptionData
+                  .startTime
+                  ? admin.firestore
+                      .Timestamp
+                      .fromDate(
+                        new Date(
+                          subscriptionData
+                            .startTime
+                        )
+                      )
+                  : admin.firestore
+                      .FieldValue
+                      .serverTimestamp(),
+              expiryDate:
+                admin.firestore
+                  .Timestamp
+                  .fromDate(
+                    expiryDate
+                  ),
+              verifiedByServer:
+                true,
+              updatedAt:
+                admin.firestore
+                  .FieldValue
+                  .serverTimestamp(),
+            },
+            {
+              merge: true,
+            }
+          );
+
+          // This is the ONLY trusted Premium
+          // entitlement document.
+          transaction.set(
+            subscriptionRef,
+            {
+              planId:
+                plan.id,
+              productId,
+              title:
+                plan.title,
+              dailyCredits:
+                plan.dailyCredits,
+              durationType:
+                plan.durationType,
+              status:
+                'active',
+              source:
+                'google_play',
+              verifiedByServer:
+                true,
+              purchaseTokenHash:
+                tokenHash,
+              googleSubscriptionState:
+                subscriptionState,
+              expiryDate:
+                admin.firestore
+                  .Timestamp
+                  .fromDate(
+                    expiryDate
+                  ),
+              updatedAt:
+                admin.firestore
+                  .FieldValue
+                  .serverTimestamp(),
+            },
+            {
+              merge: true,
+            }
+          );
+        }
+      );
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+          verified: true,
+          productId,
+          planId:
+            plan.id,
+          dailyCredits:
+            plan.dailyCredits,
+          subscriptionState,
+          expiryDate:
+            expiryDate.toISOString(),
+        });
+    } catch (error) {
+      console.error(
+        'Google Play verification failed:',
+        error?.message ||
+          'UNKNOWN_ERROR'
+      );
+
+      const message =
+        error?.message || '';
+
+      if (
+        message ===
+        'AUTH_REQUIRED' ||
+        message ===
+        'INVALID_AUTH'
+      ) {
+        return res
+          .status(401)
+          .json({
+            success: false,
+            error:
+              'Authentication required.',
+          });
+      }
+
+      if (
+        message ===
+        'PURCHASE_TOKEN_ALREADY_ASSIGNED'
+      ) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'This purchase is already linked to another account.',
+          });
+      }
+
+      if (
+        message ===
+          'UNKNOWN_PREMIUM_PRODUCT' ||
+        message ===
+          'PREMIUM_PLAN_DISABLED' ||
+        message ===
+          'INVALID_PREMIUM_PLAN' ||
+        message ===
+          'PRODUCT_ID_MISMATCH'
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              'Invalid Premium product.',
+          });
+      }
+
+      // Do not expose Google credential/API
+      // internals to the mobile client.
+      return res
+        .status(500)
+        .json({
+          success: false,
+          error:
+            'Unable to verify Google Play purchase securely.',
+        });
+    }
+  }
+);
 // ======================================================
 // SECURE ACCOUNT DELETION
 // ======================================================
