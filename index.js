@@ -3,6 +3,9 @@ const admin = require('firebase-admin');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { google } = require('googleapis');
+const {
+  registerGooglePlayRtdn,
+} = require('./google_play_rtdn');
 
 // ======================================================
 // FIREBASE ADMIN
@@ -2514,6 +2517,14 @@ app.get('/', (req, res) => {
       'Rajveon Docs Backend',
     status: 'running',
   });
+});
+registerGooglePlayRtdn({
+  app,
+  db,
+  admin,
+  packageName: GOOGLE_PLAY_PACKAGE_NAME,
+  getGooglePlayPublisherClient,
+  subscriptionStateHasEntitlement,
 });
 
 // ======================================================
