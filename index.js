@@ -23,6 +23,8 @@ const db = admin.firestore();
 
 const app = express();
 
+app.set('trust proxy', 1);
+
 // ======================================================
 // ADMOB REWARDED SSV SECURITY
 // ======================================================
