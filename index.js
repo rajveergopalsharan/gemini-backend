@@ -785,6 +785,13 @@ async function getCurrentCreditState(uid) {
         state.premiumCreditsToday =
           subscription.dailyCredits;
         state.baseCreditsToday = 0;
+      } else if (state.premiumCreditsToday > 0) {
+        // Premium ended during the same server day.
+        // Move the account safely back to today's Free plan.
+        state = createFreeState(
+          config,
+          today
+        );
       }
     }
 
@@ -859,6 +866,13 @@ async function reserveCredits({
         state.premiumCreditsToday =
           subscription.dailyCredits;
         state.baseCreditsToday = 0;
+      } else if (state.premiumCreditsToday > 0) {
+        // Premium ended during the same server day.
+        // Move the account safely back to today's Free plan.
+        state = createFreeState(
+          config,
+          today
+        );
       }
     }
 
