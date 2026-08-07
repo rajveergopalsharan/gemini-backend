@@ -569,6 +569,7 @@ function calculateFreshSummaryCredits(config, pageCount) {
 // ======================================================
 // PREMIUM ENTITLEMENT
 // ======================================================
+
 async function loadServerVerifiedSubscription(uid) {
   const snapshot = await db
     .collection('users')
@@ -586,9 +587,8 @@ async function loadServerVerifiedSubscription(uid) {
 
   const data = snapshot.data() || {};
 
-  // Client-created subscription documents are NOT trusted.
-  // Later Google Play backend verification will set:
-  // verifiedByServer: true
+  // Only server-verified Google Play subscriptions
+  // can ever grant Premium.
   if (data.verifiedByServer !== true) {
     return {
       active: false,
@@ -596,7 +596,32 @@ async function loadServerVerifiedSubscription(uid) {
     };
   }
 
-  if (data.status !== 'active') {
+  const googleSubscriptionState =
+    typeof data.googleSubscriptionState === 'string'
+      ? data.googleSubscriptionState.trim()
+      : '';
+
+  // Google Play states which still have entitlement:
+  //
+  // ACTIVE:
+  // Normal active subscription.
+  //
+  // IN_GRACE_PERIOD:
+  // Payment issue exists, but Google still grants access.
+  //
+  // CANCELED:
+  // Auto-renewal was cancelled, but the user has already
+  // paid through expiryDate, so Premium stays active until
+  // that date.
+  const stateHasEntitlement =
+    googleSubscriptionState ===
+      'SUBSCRIPTION_STATE_ACTIVE' ||
+    googleSubscriptionState ===
+      'SUBSCRIPTION_STATE_IN_GRACE_PERIOD' ||
+    googleSubscriptionState ===
+      'SUBSCRIPTION_STATE_CANCELED';
+
+  if (!stateHasEntitlement) {
     return {
       active: false,
       dailyCredits: 0,
@@ -612,17 +637,12 @@ async function loadServerVerifiedSubscription(uid) {
     expiryDate = data.expiryDate.toDate();
   }
 
-  // Rajveon Docs has NO lifetime subscription.
-  // Every trusted premium entitlement MUST contain
-  // a backend-verified expiry date.
-  if (!expiryDate) {
-    return {
-      active: false,
-      dailyCredits: 0,
-    };
-  }
-
-  if (expiryDate.getTime() <= Date.now()) {
+  // Fail closed if Google expiry is missing or invalid.
+  if (
+    !expiryDate ||
+    Number.isNaN(expiryDate.getTime()) ||
+    expiryDate.getTime() <= Date.now()
+  ) {
     return {
       active: false,
       dailyCredits: 0,
