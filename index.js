@@ -26,6 +26,54 @@ const app = express();
 app.set('trust proxy', 1);
 
 // ======================================================
+// PRODUCTION HTTP SECURITY HARDENING
+// ======================================================
+
+// Do not advertise Express to scanners/attackers.
+app.disable('x-powered-by');
+
+// Backend is an API service. These headers reduce common
+// browser-based attack surface without changing API logic.
+app.use((req, res, next) => {
+  res.setHeader(
+    'X-Content-Type-Options',
+    'nosniff'
+  );
+
+  res.setHeader(
+    'X-Frame-Options',
+    'DENY'
+  );
+
+  res.setHeader(
+    'Referrer-Policy',
+    'no-referrer'
+  );
+
+  res.setHeader(
+    'Permissions-Policy',
+    'camera=(), microphone=(), geolocation=()'
+  );
+
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+  );
+
+  res.setHeader(
+    'Cache-Control',
+    'no-store'
+  );
+
+  res.setHeader(
+    'Strict-Transport-Security',
+    'max-age=31536000; includeSubDomains'
+  );
+
+  next();
+});
+
+// ======================================================
 // ADMOB REWARDED SSV SECURITY
 // ======================================================
 
@@ -362,6 +410,17 @@ const summarizeLimiter = rateLimit({
   max: 5,
   message: {
     error: 'Too many AI requests. Please try again in one minute.',
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const creditsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: {
+    success: false,
+    error: 'Too many credit requests. Please try again in a moment.',
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -1175,7 +1234,10 @@ async function saveAiUsage({
 // ======================================================
 // CREDIT INFO ENDPOINT
 // ======================================================
-app.get('/credits', async (req, res) => {
+app.get(
+  '/credits',
+  creditsLimiter,
+  async (req, res) => {
   try {
     const decodedToken =
       await authenticateRequest(req);
@@ -1210,7 +1272,8 @@ app.get('/credits', async (req, res) => {
             : 'Unable to load credits.',
       });
   }
-});
+  }
+);
 
 // ======================================================
 // SECURE CACHED-SUMMARY CREDIT ENDPOINT
