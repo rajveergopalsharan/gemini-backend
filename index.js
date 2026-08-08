@@ -475,6 +475,59 @@ async function authenticateRequest(req) {
 }
 
 // ======================================================
+// FIREBASE APP CHECK - MONITORING MODE
+//
+// Abhi requests block nahi hongi.
+// Sirf verify karke valid / invalid status log hoga.
+// ======================================================
+
+async function verifyAppCheckMonitoring(req) {
+  const rawToken =
+    typeof req.headers['x-firebase-appcheck'] === 'string'
+      ? req.headers['x-firebase-appcheck'].trim()
+      : '';
+
+  if (!rawToken) {
+    console.warn(
+      'App Check monitoring: token missing'
+    );
+
+    return {
+      valid: false,
+      reason: 'MISSING',
+    };
+  }
+
+  try {
+    const decoded =
+      await admin
+        .appCheck()
+        .verifyToken(rawToken);
+
+    console.log(
+      'App Check monitoring: valid',
+      {
+        appId: decoded.appId || '',
+      }
+    );
+
+    return {
+      valid: true,
+      appId: decoded.appId || '',
+    };
+  } catch (_) {
+    console.warn(
+      'App Check monitoring: invalid token'
+    );
+
+    return {
+      valid: false,
+      reason: 'INVALID',
+    };
+  }
+}
+
+// ======================================================
 // SERVER DATE
 // ======================================================
 
@@ -1241,6 +1294,8 @@ app.get(
   try {
     const decodedToken =
       await authenticateRequest(req);
+
+    await verifyAppCheckMonitoring(req);
 
     const creditInfo =
       await getCurrentCreditState(
