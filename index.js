@@ -527,6 +527,69 @@ async function verifyAppCheckMonitoring(req) {
   }
 }
 
+
+// ======================================================
+// FIREBASE APP CHECK - REQUIRED MODE
+//
+// Protected app endpoints ke liye:
+// 1. App Check header required
+// 2. Token Firebase Admin se verify hoga
+// 3. Token exact Rajveon Docs Android app ka hona chahiye
+// ======================================================
+
+const EXPECTED_FIREBASE_ANDROID_APP_ID =
+  '1:565896848743:android:20bace03a318b22fbafbc2';
+
+async function verifyAppCheckRequired(req) {
+  const rawToken =
+    typeof req.headers['x-firebase-appcheck'] === 'string'
+      ? req.headers['x-firebase-appcheck'].trim()
+      : '';
+
+  if (!rawToken) {
+    const error =
+      new Error('APP_CHECK_REQUIRED');
+
+    error.statusCode = 401;
+
+    throw error;
+  }
+
+  let decoded;
+
+  try {
+    decoded =
+      await admin
+        .appCheck()
+        .verifyToken(rawToken);
+  } catch (_) {
+    const error =
+      new Error('INVALID_APP_CHECK');
+
+    error.statusCode = 401;
+
+    throw error;
+  }
+
+  const appId =
+    typeof decoded?.appId === 'string'
+      ? decoded.appId.trim()
+      : '';
+
+  if (
+    appId !==
+    EXPECTED_FIREBASE_ANDROID_APP_ID
+  ) {
+    const error =
+      new Error('APP_CHECK_APP_MISMATCH');
+
+    error.statusCode = 403;
+
+    throw error;
+  }
+
+  return decoded;
+}
 // ======================================================
 // SERVER DATE
 // ======================================================
@@ -1295,7 +1358,7 @@ app.get(
     const decodedToken =
       await authenticateRequest(req);
 
-    await verifyAppCheckMonitoring(req);
+    await verifyAppCheckRequired(req);
 
     const creditInfo =
       await getCurrentCreditState(
