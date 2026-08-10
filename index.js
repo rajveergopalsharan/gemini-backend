@@ -1607,6 +1607,8 @@ app.post(
       const decodedToken =
         await authenticateRequest(req);
 
+      await verifyAppCheckRequired(req);
+
       uid = decodedToken.uid;
 
       const {
