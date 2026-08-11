@@ -2247,6 +2247,8 @@ app.post(
       const decoded =
         await authenticateRequest(req);
 
+      await verifyAppCheckRequired(req);
+
       uid = decoded.uid;
 
       if (!uid) {
